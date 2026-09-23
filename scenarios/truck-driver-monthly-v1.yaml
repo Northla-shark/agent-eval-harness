@@ -1,0 +1,28 @@
+# 场景定义 · Layer 0
+# 任何阈值都写在这里，不许硬编码进函数体。
+# 硬编码的阈值 = 无法消融 = 无法回答"这个数字是怎么来的"。
+name: truck-driver-monthly-v1
+variant: baseline
+adapter_name: truck        # D2 之前改成 dummy 才能跑起来
+prompt_version: v0
+
+# 模型侧（会进 run_id）
+model_name: qwen3-max
+model_api_url: ""
+temperature: 0.0
+
+# 场景侧（会进 run_id）
+driver_ids: [d001, d002, d003, d004, d005]
+duration_days: 30
+max_steps: 400
+
+# 预算侧（会进 run_id）—— 三维熔断，缺一维就不叫熔断
+max_tokens_per_driver: 400000
+max_wall_time_minutes: 20
+
+# 运行侧（不进 run_id）
+concurrency: 4
+rpm: 600
+tpm: 2000000
+token_profile: no_history
+enforce_limits: true

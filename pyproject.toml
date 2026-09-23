@@ -1,0 +1,25 @@
+[project]
+name = "agent-eval-harness"
+version = "0.1.0"
+description = "评测、可观测与 A/B 实验平台，面向长时程决策型 Agent"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["pyyaml>=6.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["evalharness", "evalharness.budget", "evalharness.metrics", "adapters"]
+
+# mypy 的要求写在项目约定里：类型标注必须完整。
+# 没装 mypy 也能跑，但收尾前一定要装一次，跑出 0 error 再打 tag。
+[tool.mypy]
+python_version = "3.11"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

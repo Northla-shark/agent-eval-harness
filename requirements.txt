@@ -1,0 +1,3 @@
+# Day 0 的依赖刻意压到最小：装不上任何东西都不应该阻塞你开工。
+# Langfuse 在 requirements-langfuse.txt 里，等 D3 再接。
+pyyaml>=6.0
