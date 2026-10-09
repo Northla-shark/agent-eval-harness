@@ -4,7 +4,7 @@
 
     python tools/smoke.py
 
-它检查 6 件事，顺序是刻意的：从最底层的纯函数往上走到端到端，
+它检查 7 件事，顺序是刻意的：从最底层的纯函数往上走到端到端，
 任何一层坏了都能立刻定位，而不是看到一个空结果去猜。
 
   1. limiter    —— 双令牌桶的速率、回滚、结算
@@ -14,6 +14,7 @@
   5. 端到端     —— 同一环境下跑两个 variant，打出对照表
   6. 接线       —— LLMGate 的缓存与计数、TruckAdapter 的协议完整性
                   （**不需要项目一的代码、不需要 API key**）
+  7. 指标层     —— 用历史跑批验证指标口径（**本机没有项目一则整节跳过**）
 
 不需要任何 API key。退出码 0 = 全绿。
 """
@@ -40,6 +41,8 @@ from evalharness.config import ConfigSnapshot, diff  # noqa: E402
 from evalharness.experiment import compare_table, save_run  # noqa: E402
 from evalharness.limiter import DualTokenBucketLimiter, TokenBucket  # noqa: E402
 from evalharness.llm_gate import LLMGate  # noqa: E402
+from evalharness.metrics import history as hist  # noqa: E402
+from evalharness.metrics import process as proc  # noqa: E402
 from evalharness.observability import ConsoleTracer  # noqa: E402
 from evalharness.runner import run_scenario  # noqa: E402
 from evalharness.scenario import Scenario  # noqa: E402
@@ -72,7 +75,7 @@ class FrozenClock:
 
 # ---------------------------------------------------------------------------
 def s1_limiter() -> None:
-    print("\n[1/6] 限流器：双令牌桶 + 预扣结算")
+    print("\n[1/7] 限流器：双令牌桶 + 预扣结算")
 
     # 速率与突发
     b = TokenBucket(capacity=10, refill_per_sec=10 / 60, clock=FrozenClock())
@@ -104,7 +107,7 @@ def s1_limiter() -> None:
 
 # ---------------------------------------------------------------------------
 def s2_estimator() -> None:
-    print("\n[2/6] Token 预估器：系数来自历史 14 组跑批")
+    print("\n[2/7] Token 预估器：系数来自历史 14 组跑批")
 
     nh = PROFILES["no_history"]
     h5 = PROFILES["history_5"]
@@ -126,7 +129,7 @@ def s2_estimator() -> None:
 
 # ---------------------------------------------------------------------------
 def s3_cache() -> None:
-    print("\n[3/6] 缓存层：LRU + TTL，18 项边界")
+    print("\n[3/7] 缓存层：LRU + TTL，18 项边界")
     check("LRU+TTL 全部边界用例通过", cache_self_test(verbose=False) is True)
 
     c = LRUKVCache(2, 1000)
@@ -138,7 +141,7 @@ def s3_cache() -> None:
 
 # ---------------------------------------------------------------------------
 def s4_config() -> None:
-    print("\n[4/6] Config Snapshot：run_id 由配置内容决定")
+    print("\n[4/7] Config Snapshot：run_id 由配置内容决定")
 
     base = dict(
         model_name="m-a", model_api_url="", temperature=0.0,
@@ -163,7 +166,7 @@ def s4_config() -> None:
 
 # ---------------------------------------------------------------------------
 def s5_end_to_end() -> None:
-    print("\n[5/6] 端到端：同一环境，两个 variant")
+    print("\n[5/7] 端到端：同一环境，两个 variant")
 
     base = Scenario.tiny(max_steps=200, max_tokens_per_driver=5_000_000)
     degenerate = base.with_variant("degenerate", adapter_name="dummy")
@@ -225,7 +228,7 @@ def s6_wiring() -> None:
     （抛可读错误）并通过协议检查。这是"平台与被测对象解耦"的可执行证明，
     不是文档里的一句承诺。
     """
-    print("\n[6/6] 接线：LLMGate + TruckAdapter 协议完整性")
+    print("\n[6/7] 接线：LLMGate + TruckAdapter 协议完整性")
 
     tracer = ConsoleTracer()
     limiter = DualTokenBucketLimiter(rpm=600, tpm=2_000_000)
@@ -272,13 +275,88 @@ def s6_wiring() -> None:
 
 
 # ---------------------------------------------------------------------------
+def s7_metrics_on_history() -> None:
+    """指标层 × 历史跑批：口径一致性验证。
+
+    ★ 为什么是"读历史数据"而不是"新跑一次仿真"：
+        **用历史数据验证指标层的一致性，而不是新跑一次 —— 新跑一次只能验证一次。**
+        新跑一次只提供一个样本点，且与指标实现同源（口径错了它会一起错，看不出来）。
+        历史跑批是已经发生过的独立数据，零成本，且能同时验证多组。
+
+    项目一不在本机时**整节跳过且不记失败**：平台不能依赖被测对象的私有目录才能自检。
+    """
+    print("\n[7/7] 指标层：用历史跑批验证口径（不是新跑一次）")
+
+    if not hist.available():
+        print("    [跳过] 本机无历史跑批（clone 本仓库的人默认没有）-> 不计失败")
+        print("           要跑这一段：`python tools/check_metrics_history.py --root <路径>`")
+        return
+
+    runs = hist.list_runs()
+    print(f"    发现 {len(runs)} 组跑批；抽验 A/B 两组 + 两种长度的基准")
+
+    # --- 1) 震荡指纹：A 组的已知真值 ---
+    a_name = "上传偏好+历史5步+休息时间统计 补充三种prompt+要求输出秒数"
+    a = hist.load_run(a_name)
+    if a is None:
+        check("历史跑批可加载", False, f"找不到 {a_name}")
+        return
+    a_steps = [s for e in hist.load_episodes(a_name) for s in e.steps]
+    counts = proc.signature_counts(a_steps)
+    check(
+        "★ 震荡指纹复现：wait(duration=60) = 146 次",
+        counts.get("wait(duration=60)") == 146,
+        f"实测 {counts.get('wait(duration=60)')}",
+    )
+    print(f"    A 组 {len(a_steps)} 步 · top3 签名：{list(counts.items())[:3]}")
+
+    lsr_a = proc.loop_signature_rate(a_steps)
+    print(f"    A 组震荡率 = {lsr_a:.4f}（B 组对照见 check_metrics_history.py）")
+    check("震荡率落在 [0,1]", 0.0 <= lsr_a <= 1.0, f"{lsr_a}")
+
+    # --- 2) 罚分信噪比的两个已知基准 ---
+    for name, label, expected in [
+        ("4个agent_0801_紧迫度", "1 天基准", 0.026),
+        ("只接了llm 测30天", "30 天基准", 0.672),
+    ]:
+        r = hist.load_run(name)
+        if r is None:
+            check(f"{label} 可加载", False, name)
+            continue
+        psr = proc.penalty_signal_ratio(hist.penalty_by_cause(r))
+        check(
+            f"★ {label} 罚分信噪比 = {psr:.1%}（已知基准 {expected:.1%}）",
+            abs(psr - expected) <= 0.005,
+            f"实测 {psr:.4f}",
+        )
+
+    # --- 3) 三个指标都能在历史数据上跑出结果（不是 NotImplementedError）---
+    episodes_a = hist.load_episodes(a_name)
+    res = proc.run_process(episodes_a, penalty_by_cause=hist.penalty_by_cause(a))
+    check("run_process 三个补齐指标全部有值",
+          {"loop_signature_rate", "penalty_signal_ratio", "constraint_precision"} <= set(res))
+    check(
+        "★ constraint_precision 无可行集时是 None 而不是编造的数字",
+        res["constraint_precision"] is None,
+        f"实测 {res['constraint_precision']}",
+    )
+    check(
+        "penalty_signal_ratio 有真实罚分数据时非 None",
+        res["penalty_signal_ratio"] is not None,
+    )
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     print("=" * 72)
     print("AgentEval Harness · smoke 自检")
     print(f"仓库根目录：{ROOT}")
     print("=" * 72)
 
-    for fn in (s1_limiter, s2_estimator, s3_cache, s4_config, s5_end_to_end, s6_wiring):
+    for fn in (
+        s1_limiter, s2_estimator, s3_cache, s4_config,
+        s5_end_to_end, s6_wiring, s7_metrics_on_history,
+    ):
         try:
             fn()
         except Exception as exc:  # 自检脚本自己绝不能把异常吞掉

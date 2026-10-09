@@ -36,6 +36,10 @@ python tools/smoke.py
 三行命令跑完，你会看到一个 A/B 对照表 + 每个 span 的出现次数。
 不需要任何 API key —— `adapters/dummy.py` 不调用模型。
 
+```bash
+python tools/check_metrics_history.py   # 可选：用历史跑批验证指标层口径（本机无历史数据则跳过）
+```
+
 ## 架构
 
 ```
@@ -58,11 +62,12 @@ Layer 4  Experiment    ── A/B + 消融 + 报告
 | P0 | ConfigSnapshot（run_id = 配置哈希 + 代码哈希） | 骨架已就位 |
 | P0 | Adapter 协议 + asyncio 并发 + 三维 BudgetGuard | 骨架已就位 |
 | P0 | 9 段 Span schema + ConsoleTracer | 骨架已就位，Langfuse 待接 |
-| P0 | 指标四件套 | **待你写**（`metrics/process.py` 只给了 1 个示例） |
+| P0 | 指标四件套 | 已实现（动作分布 / 每单调用 / 震荡率 / 罚分信噪比）；约束精度**主动放弃**，理由见 `docs/metrics.md` 第 5 节 |
 | P1 | 双令牌桶限流器 + 有界队列 | 已实现，待接进 Runner |
 | P1 | Token 预估器 | 已实现（系数来自历史 14 组跑批校准） |
 | P1 | LRU + TTL 缓存层 | 已实现，18/18 自测通过 |
-| P2 | 消融 / replay | 待你写 |
+| P2 | replay（历史跑批回放） | 已实现（`metrics/history.py`）；本机无被测对象时自动跳过 |
+| P2 | 消融 | 待你写（D5） |
 
 ## 设计决策
 
