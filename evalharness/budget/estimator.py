@@ -2,7 +2,7 @@
 """Token 预估器：为限流器的预扣提供 estimated_tokens。
 
 这个模块的特殊之处：它不是设计出来的，是从历史数据里拟合出来的。
-系数来自项目一 14 组历史跑批（tools/calibrate_token_model.py，
+系数来自项目一 10 组历史跑批（tools/calibrate_token_model.py，
 已实测复现：S=3,499 / K=-0.4 / 误差 +0.9% 等）。
 
 核心公式：总 token ≈ n·S + K·n(n−1)/2 + n·C

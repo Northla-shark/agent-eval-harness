@@ -501,7 +501,7 @@ class TruckAdapter:
                 # 步级 reward = 运价 − 行驶成本。
                 # 不含**偏好罚分**：罚分属于「评测口径」，不属于「环境回报」。
                 # 混进来的后果是"环境替你被判了分"，A/B 时就说不清差异来自决策还是来自罚则。
-                # 罚分单独在 D4 的 penalty_signal_ratio 里用 14 组历史跑批归因。
+                # 罚分单独在 D4 的 penalty_signal_ratio 里用 10 组历史跑批归因。
                 reward = price_yuan - cost_per_km * distance
         else:
             # 未知动作不杀死评测：推进 1 分钟并记下来。

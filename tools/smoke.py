@@ -107,7 +107,7 @@ def s1_limiter() -> None:
 
 # ---------------------------------------------------------------------------
 def s2_estimator() -> None:
-    print("\n[2/7] Token 预估器：系数来自历史 14 组跑批")
+    print("\n[2/7] Token 预估器：系数来自历史 10 组跑批")
 
     nh = PROFILES["no_history"]
     h5 = PROFILES["history_5"]
