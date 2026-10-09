@@ -104,6 +104,27 @@ def s1_limiter() -> None:
     check("结算：实际少于预估时退还", lim2.tpm.tokens > 200.0, f"{lim2.tpm.tokens}")
     check("指标：rejected 被计数", lim2.rejected >= 0)
 
+    # ★ D2 欠账偿还：TPM 上限一旦被悄悄突破，限流器必须知道
+    clk3 = FrozenClock()
+    lim3 = DualTokenBucketLimiter(rpm=100, tpm=1000, clock=clk3)
+    lim3.acquire(100)             # tpm: 1000 -> 900
+    lim3.settle(100, 5000)        # 实际多花 4900，桶里只剩 900 -> 记欠账而不是丢掉
+    owed = lim3.tpm.debt()
+    check("★ D2 欠账：桶不够补扣时不静默丢失", owed > 0, f"debt={owed}")
+    check("★ D2 欠账：events 被计数（老板被击穿过的证据）", lim3.debt_events == 1)
+    check("★ D2 欠账：进多维计数器可被观测", lim3.counters()["limiter.tpm_debt"] > 0)
+
+    ok3, _ = lim3.acquire(1)      # 时钟没推进 = 没令牌补充 -> 必须连欠账一起付
+    check("★ D2 欠账偿还：没还清前不许发新请求", ok3 is False, f"ok={ok3}")
+
+    clk3.advance(600.0)           # 补充足够：债务被清偿，之后才能正常放行
+    ok4, _ = lim3.acquire(1)
+    check("★ D2 欠账偿还：补充后优先清偿债务", ok4 is True and lim3.tpm.debt() < owed,
+          f"debt={lim3.tpm.debt()} owed={owed}")
+    check("★ D2 欠账：已偿还量被计数（累计欠过 - 现在还欠）",
+          lim3.counters()["limiter.debt_repaid"] > 0,
+          f"repaid={lim3.counters()['limiter.debt_repaid']}")
+
 
 # ---------------------------------------------------------------------------
 def s2_estimator() -> None:
@@ -251,6 +272,37 @@ def s6_wiring() -> None:
     check("LLMGate 自发开 llm_inference span", cov["llm_inference"] >= 3, f"{cov['llm_inference']}")
     check("★ 限流/缓存计数器可读出（讲 Q21 时的现场证据）",
           {"llm.calls", "llm.cache_hit_rate", "llm.tokens_total"} <= set(gate.counters()))
+
+    # ★ D2：省下的和花掉的必须分别可见
+    # 命中时 usage 不清零 -> 缓存省的 token 会被算成"这次花了"，
+    # 于是"开了缓存"和"模型变便宜了"在成本表上长得一模一样，无法归因。
+    spent_before = gate.usage_total.total
+    hit = gate.call(payload, node="agent1", driver_id="d001", step=0)
+    check("★ D2 缓存命中：返回体 usage 清零（省的不能记成花的）",
+          (hit["usage"]["total_tokens"], hit["usage"]["prompt_tokens"]) == (0, 0),
+          f"{hit['usage']}")
+    check("★ D2 缓存：省下的 token 单独记账", gate.saved_tokens > 0, f"saved={gate.saved_tokens}")
+    check("★ D2 缓存：命中不虚增 usage_total", gate.usage_total.total == spent_before)
+
+    from evalharness.metrics.cost import run_cost  # noqa: E402
+
+    c = run_cost([], profile_name="no_history", saved_tokens=100)
+    check("★ D2 成本表：花掉的与省下的分成两行",
+          c["tokens_total"] == 0 and c["tokens_saved_by_cache"] == 100, f"{c}")
+
+    # ★ D2：预估器两套口径已合并（不再是「S/K/C」与「字符粗估」各算各的）
+    from evalharness.budget.estimator import estimate_call_tokens, step_input_tokens  # noqa: E402
+
+    p5 = PROFILES["history_5"]
+    floor0 = int(step_input_tokens(0, p5) + p5.completion_per_step)
+    floor20 = int(step_input_tokens(20, p5) + p5.completion_per_step)
+    check("★ D2 合并口径：payload 很小时以 S/K 曲线为准",
+          estimate_call_tokens(100, 0, p5) == floor0)
+    check("★ D2 合并口径：payload 很大时以字符粗估为准（取更保守的一侧）",
+          estimate_call_tokens(500_000, 0, p5) > floor0)
+    check("★ D2 合并口径：「第几步」仍然生效（K 项没被字符估计顶掉）",
+          estimate_call_tokens(100, 20, p5) == floor20,
+          f"got={estimate_call_tokens(100, 20, p5)} expect={floor20}")
 
     # --- TruckAdapter：只查「协议完整性 + 报错是否可读」，不碰项目一 ---
     from adapters.truck import TruckAdapter

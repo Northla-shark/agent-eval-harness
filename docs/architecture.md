@@ -50,13 +50,56 @@ limiter.settle(estimated, actual)  ── 多退少补
 
 ## 5. 已知的简化（主动讲，不要说"完美"）
 
-1. `limiter.settle()` 在「实际远超预估且桶内不够」时，欠账会静默丢失。
-   严格做法：记负余额，下次 acquire 时优先偿还。
-2. `ConsoleTracer` 只做内存记录，没有跨进程持久化。
-3. 震荡检测只覆盖「动作 + 关键参数」重复，没有覆盖「状态回退后重复」。
+**D2 已修掉的一条**（留着说明曾经的问题形态）：
+`limiter.settle()` 原先在「实际远超预估且桶内不够补扣」时用 `try_acquire` 补扣，
+拿不到就返回 False —— **欠账静默丢失**。后果不是报错，而是更坏的：
+限流器以为自己还有额度，继续放行，TPM 上限被无声突破，`limiter.rejected` 仍然显示 0。
+现在改成负余额（`TokenBucket.consume` 允许转负），`acquire` 的额度 =
+`本次预估 + 当前欠账`，必须先还清才能发下一次。
+配套可观测项：`limiter.tpm_debt` / `limiter.debt_events` / `limiter.debt_repaid`。
+> 一句话记法：**最危险的不是被限流，是限流器以为自己没被击穿。**
+
+仍然存在的简化：
+
+1. **token 仍是按字符粗估，没有真实 tokenizer。**
+   `CHARS_PER_TOKEN = 2`（中英混排的经验值），真实 tokenizer 对纯中文约 1.5 char/token、
+   对 JSON/代码可以低到 3。所以预估值在 ±30% 量级是**结构性**的，不是 bug。
+   实测：合并口径后，同一份新跑批上平均绝对偏差从 74.47% 降到 27.17%。
+   升级路径：`tiktoken` / 模型厂商的 count_tokens 端点 —— 但那要多一次网络往返，
+   所以生产上更常见的做法是**保留粗估 + 用 settle 的差额做滚动校准**
+   （把 `limiter.debt_ever` 与单次最大的几次偏差喂回去调 S/K/C）。
+
+2. **预估系数 S/K/C 与被测场景是手工绑定的。**
+   `scenarios/truck-driver-d1-smoke.yaml` 配的是 `no_history`（K=0），
+   但项目一每步会喂 5 步历史 —— 也就是说「第几步」这个信号本来更值钱，
+   是**配置把它关掉了**。这是真实存在的一处配置错误，暂未改（改它会让所有 run_id 变化）。
+   升级路径：让 Scenario 校验 `token_profile` 与 adapter 声明的上下文策略是否匹配，不匹配就报错。
+
+3. **纯步索引公式在真实数据上的方差极大。**
+   10 组真实跑批（token 是真花出来的钱）上，汇总偏差看着只有 -2.10%，
+   但**单组区间跨 [-60.26%, +301.19%]** —— 单看均值是最容易自欺的一句话。
+   所以 `tools/compare_estimate.py` 同时打汇总值和分布的两个尾巴。
+   升级路径：按「上下文策略 × 模型」分桶拟合 profile，而不是全场景共用一套系数。
+
+4. **`ConsoleTracer` 只做内存记录，没有跨进程持久化**（Langfuse 接入属 D3，未做）。
+
+5. **震荡检测只覆盖「动作 + 关键参数」重复**，没有覆盖「状态回退后重复」。
+
+6. **令牌桶是无锁的。** 当前 truck 场景 `concurrency: 1`（受项目一环境限制），
+   所以没有真实竞争；多线程/多进程要按 shared counter 重做，不能假装它存在。
 
 ## 6. 待办
 
-- [ ] D2：把 `adapters/truck.py` 接上项目一（LangGraph 四节点）
+- [x] D1：把 `adapters/truck.py` 接上项目一（LangGraph 四节点）—— **已完成**
+- [x] D2：限流器欠账偿还 + 模型响应缓存 + 预估器口径合并 —— **已完成**（2026-10-09）
+- [x] D4：补齐 `metrics/process.py` 的 3 个 TODO 指标 —— **已完成**（2026-10-09）
 - [ ] D3：接 Langfuse（本机 Docker 未安装，走云端免费额度）
-- [ ] D4：补齐 `metrics/process.py` 的 3 个 TODO 指标
+- [ ] D5：三组消融，把真数字填进 README 的 Results
+- [ ] D6：文档收口与发布
+
+D2 的验收数字与命令：
+
+```
+.venv\Scripts\python.exe tools\smoke.py            # 55 通过 / 0 失败
+.venv\Scripts\python.exe tools\compare_estimate.py # 预估器口径合并前后对比
+```

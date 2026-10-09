@@ -21,8 +21,20 @@ from .config import ConfigSnapshot
 from .limiter import DualTokenBucketLimiter
 from .llm_gate import LLMGate
 from .observability import ConsoleTracer, Tracer
+from .queue import BoundedTaskQueue, Overload
 from .scenario import Scenario
 from .types import EpisodeResult, StepResult, Usage, ZERO_USAGE
+
+
+class WaitTicket:
+    """一张「等待令牌」的票。被限流的等待者拿它在队列里排队，而不是自己在那空转重试。"""
+
+    __slots__ = ("estimated", "event", "granted")
+
+    def __init__(self, estimated: int) -> None:
+        self.estimated = estimated
+        self.event = asyncio.Event()
+        self.granted = False
 
 
 @dataclass
@@ -118,14 +130,31 @@ class Runner:
             repo_dir=repo_dir,
         )
 
+        # 逐次调用的「预估 vs 实际」台账，跟着 run_id 落盘。
+        # 放在这里而不是 gateway 内部猜路径：只有 Runner 知道这次 run 落在哪个目录。
+        self.gate.audit_path = Path("runs") / self.snapshot.run_id / "llm_calls.jsonl"
+
+        # 有界队列（D2 可选项）：被限流的请求在队列里**排队**，不再各自空转重试。
+        # 收益有两个：一是多个等待者 FIFO 放行（原先谁抢到算谁的，会饿死慢的那个）；
+        # 二是 queue depth 成了过载最早的信号 —— 比报错早得多。
+        self.queue = BoundedTaskQueue(
+            maxsize=max(4, scenario.concurrency * 2), policy=Overload.QUEUE
+        )
+        self.queue_max_depth = 0
+        self.queue_timeout = 30.0  # 「无界等待」= 另一种形式的拒绝
+
     # ------------------------------------------------------------------
     async def run(self) -> RunResult:
         t0 = time.perf_counter()
-        tasks = [
-            self._guarded(driver_id, self.scenario.seed + i)
-            for i, driver_id in enumerate(self.scenario.driver_ids)
-        ]
-        episodes = list(await asyncio.gather(*tasks))
+        pump = asyncio.ensure_future(self._pump())
+        try:
+            tasks = [
+                self._guarded(driver_id, self.scenario.seed + i)
+                for i, driver_id in enumerate(self.scenario.driver_ids)
+            ]
+            episodes = list(await asyncio.gather(*tasks))
+        finally:
+            pump.cancel()
         return RunResult(
             run_id=self.snapshot.run_id,
             scenario_name=self.scenario.name,
@@ -134,8 +163,45 @@ class Runner:
             episodes=episodes,
             wall_seconds=time.perf_counter() - t0,
             limiter_counters=self.limiter.counters(),
-            extra={"llm": self.gate.counters()},
+            extra={
+                "llm": self.gate.counters(),
+                "queue.max_depth": self.queue_max_depth,
+            },
         )
+
+    async def _pump(self) -> None:
+        """令牌分发泵：一次只处理一张票，按入队顺序放行。
+
+        「重试」和「排队」的代码差别就在这一步：
+        重试是每个请求自己循环 acquire + sleep —— N 个等待者抢同一批令牌，
+        先到先得，慢的那个可能永远抢不到；
+        排队是等待者交出票、由一个泵串行放行 —— FIFO，饿死不可能发生，
+        而且队列深度可以暴露成指标。
+        """
+        while True:
+            ticket: WaitTicket = await self.queue.get()
+            await self._grant(ticket)
+
+    async def _grant(self, ticket: WaitTicket) -> None:
+        """阻塞式等令牌 —— **必须有上界**。
+
+        预估值超过 TPM 桶容量时 acquire 永远成功不了，泵会带着这张票无限自旋，
+        后面的票全部饿死。所以这里同样用 queue_timeout 兜底：
+        超时就把票释放掉（granted 保持 False），由等待方自己判定为饥饿。
+        """
+        deadline = time.perf_counter() + self.queue_timeout
+        while True:
+            ok, wait = self.limiter.acquire(ticket.estimated)
+            if ok:
+                ticket.granted = True
+                ticket.event.set()
+                return
+            if time.perf_counter() >= deadline:
+                ticket.event.set()   # 放行等待者，让它看到 granted=False
+                return
+            nap = min(max(wait, 0.001), 0.05)
+            self.limiter.waited_seconds += nap
+            await asyncio.sleep(nap)
 
     async def _guarded(self, driver_id: str, seed: int) -> EpisodeResult:
         # Semaphore 在这里限的是"同时在跑的司机数"，
@@ -179,18 +245,20 @@ class Runner:
                 # 一步打多次模型的（truck: 3 个节点）走 self_limited 分支，
                 # 由 LLMGate 按**每次调用**计账 —— 粒度必须跟被测对象的真实调用次数对齐。
                 if self.scenario.enforce_limits and not self_limited:
-                    ok, wait = self.limiter.acquire(estimated)
-                    if not ok:
-                        stall += 1
-                        if stall > 500:
-                            # 连续 500 次拿不到令牌：不是"忙"，是配额配错了
-                            stop_reason = "limiter_starved"
-                            break
-                        # 有上限的等待 —— 无界等待等于另一种形式的拒绝
-                        nap = min(max(wait, 0.001), 0.05)
-                        self.limiter.waited_seconds += nap
-                        await asyncio.sleep(nap)
-                        continue
+                    ticket = WaitTicket(estimated)
+                    self.queue_max_depth = max(self.queue_max_depth, self.queue.depth())
+                    status = await self.queue.submit(ticket, deadline=self.queue_timeout)
+                    self.queue_max_depth = max(self.queue_max_depth, self.queue.depth())
+                    if status in ("rejected", "timeout"):
+                        # 队列溢出/超时 = 背压生效：明确说出来，别伪装成"跑完了"
+                        stop_reason = f"queue_{status}"
+                        break
+                    # 排到队了就等泵放行。这里是 await 一个 Event，不是 while+sleep 重试。
+                    await ticket.event.wait()
+                    if not ticket.granted:
+                        # 不是"忙"，是配额配错了：单次预估就超过 TPM 桶容量
+                        stop_reason = "limiter_starved"
+                        break
                     stall = 0
 
                 # --- span 4：LLM 推理 ---

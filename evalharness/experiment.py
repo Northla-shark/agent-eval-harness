@@ -19,6 +19,7 @@ from .runner import RunResult
 
 def run_metrics(result: RunResult, *, profile_name: str = "no_history") -> dict[str, Any]:
     """把一次 run 的三层指标汇总成一个 JSON-able dict。"""
+    llm = dict(result.extra.get("llm", {}))
     return {
         "run_id": result.run_id,
         "variant": result.variant,
@@ -26,8 +27,16 @@ def run_metrics(result: RunResult, *, profile_name: str = "no_history") -> dict[
         "wall_seconds": round(result.wall_seconds, 3),
         "outcome": outcome_m.run_outcome(result.episodes),
         "process": process_m.run_process(result.episodes),
-        "cost": cost_m.run_cost(result.episodes, profile_name=profile_name),
+        "cost": cost_m.run_cost(
+            result.episodes,
+            profile_name=profile_name,
+            # 缓存省下的 token 进成本表：省下的与花掉的必须在同一张表上分开可见。
+            saved_tokens=int(llm.get("llm.tokens_saved", 0)),
+        ),
         "limiter": result.limiter_counters,
+        # LLMGate 的逐次台账（含预估器自身的偏差分布）。D2 起它才进 metrics.json ——
+        # 之前 RunResult.to_dict() 里带了但落盘版漏了，等于这一层观测不存在。
+        "llm": llm,
     }
 
 

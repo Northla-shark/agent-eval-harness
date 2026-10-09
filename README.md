@@ -106,18 +106,21 @@ Layer 4  Experiment    ── A/B + 消融 + 报告
 | P0 | Adapter 协议 + asyncio 并发 + 三维 BudgetGuard | 已实现并接进 Runner |
 | P0 | 9 段 Span schema + ConsoleTracer | ConsoleTracer 已实现；**LangfuseTracer 未实现**（D3，`span()` 仍抛 `NotImplementedError`） |
 | P0 | 指标四件套 | 已实现（动作分布 / 每单调用 / 震荡率 / 罚分信噪比）；约束精度**主动放弃**，理由见 `docs/metrics.md` 第 5 节 |
-| P1 | 双令牌桶限流器 | 已实现并接进 Runner；**`settle()` 的欠账偿还未实现**（D2） |
-| P1 | 有界队列 | 模块已实现（`queue.py`），**未接进 Runner** |
+| P1 | 双令牌桶限流器 | 已实现并接进 Runner；`settle()` 的**欠账偿还已实现**（D2）：补扣不够时记负余额，下次 acquire 的额度 = 本次预估 + 欠账 |
+| P1 | 有界队列 | 已接进 Runner（D2）：被限流的请求在 `BoundedTaskQueue` 里 FIFO 排队，由一个令牌泵串行放行，取代原先各请求自循环重试 |
 | P1 | Token 预估器 | 已实现（系数来自历史 10 组跑批校准） |
 | P1 | LRU + TTL 缓存层 | 已实现，18/18 自测通过 |
 | P1 | 项目一接入（TruckAdapter + LLMGate + 节点级归因） | 已实现（D1）；`tools/check_truck.py` 17 项通过 |
+| P1 | 模型响应缓存 | 已实现在 `LLMGate`（不是 Runner —— prompt 只在节点内部存在，按步缓存无从下手）；命中时 usage 清零、省下的 token 记 `saved_tokens`，成本表里与花掉的分两行 |
 | P1 | 模型替身（`stub.py`，零 API 成本跑全链路） | 已实现 |
+| P1 | 预估器口径合并 | 已实现（D2）：单次预估 = `max(S + K·step, chars//2) + C`，「第几步」与「payload 多大」合到一个公式里；逐次台账落盘 `runs/<run_id>/llm_calls.jsonl` |
 | P2 | 历史跑批回放 | 已实现（`metrics/history.py`）；本机无被测对象时自动跳过 |
 | P2 | 三组消融 | **未做（D5）** —— 现有 Results 是 dummy 变体对照 + 历史 A/B 对照，**不是消融** |
 | P2 | 文档收口与发布 | **未做（D6）** |
 
-自检：`.venv\Scripts\python.exe tools\smoke.py` → 42 通过 / 0 失败
-（本机无项目一历史数据时第 7 节跳过，为 35 / 0）。
+自检：`.venv\Scripts\python.exe tools\smoke.py` → 55 通过 / 0 失败
+（本机无项目一历史数据时第 7 节跳过，为 48 / 0）。
+预估器精度前后对比：`.venv\Scripts\python.exe tools\compare_estimate.py`。
 
 ## 设计决策
 

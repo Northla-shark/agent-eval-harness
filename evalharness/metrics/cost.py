@@ -33,9 +33,14 @@ def estimate_deviation(
 
     这是预估器的体检报告：一个预估器如果从不校准，它就是一个装饰品。
 
-    注意：这里的"实际"是逐步累加的真实 usage，
-    "预估"用的是同一个 profile 的逐步预估 —— 所以偏差反映的是
-    profile 与当前场景的失配程度，而不是预估器算错了。
+    注意两件事：
+     1. 这里的"实际"是逐步累加的真实 usage，"预估"用的是同一个 profile 的
+        **逐步**预估 —— 所以偏差反映的是 profile 与当前场景的失配程度，
+        不是预估器算错了。
+     2. 它是**规划口径**：默认"一步一次调用"，不知道一步到底打了几次模型。
+        项目管理粒度真正的 per-call 偏差看 `metrics.json` 里的 `llm.est_mean_rel_error`
+        （由 LLMGate 逐次记账得出）—— 那一个数才含调用粒度与 payload 大小两个信号。
+        两个数并存是有意的：规划值用来定预算，per-call 值用来评价预估器。
     """
     profile: TokenProfile = PROFILES[profile_name]
     rel_errors: list[float] = []
@@ -54,7 +59,18 @@ def estimate_deviation(
     }
 
 
-def run_cost(episodes: list[EpisodeResult], *, profile_name: str = "no_history") -> dict[str, Any]:
+def run_cost(
+    episodes: list[EpisodeResult],
+    *,
+    profile_name: str = "no_history",
+    saved_tokens: int = 0,
+) -> dict[str, Any]:
+    """Cost 层汇总。
+
+    saved_tokens 必须进来：**省下的和花掉的要在同一张表里**。
+    只报 tokens_total 的话，开缓存 = 成本下降 = 看起来像模型变便宜了；
+    而这两种改进的工程量差一个数量级，混在一起就没法归因。
+    """
     n = len(episodes)
     total = token_total(episodes)
     return {
@@ -62,6 +78,13 @@ def run_cost(episodes: list[EpisodeResult], *, profile_name: str = "no_history")
         "tokens_per_driver_mean": round(total / n, 1) if n else 0.0,
         "tokens_per_driver_median": (
             statistics.median([e.usage_total.total for e in episodes]) if n else 0.0
+        ),
+        # 缓存命中而没发出的 token。它**不计入** tokens_total（确实没花），
+        # 但必须单独一行 —— 否则"省了多少"这件事在报告里消失。
+        "tokens_saved_by_cache": int(saved_tokens),
+        "cache_saving_rate": (
+            round(saved_tokens / (total + saved_tokens), 4)
+            if (total + saved_tokens) else 0.0
         ),
         "estimate_deviation": estimate_deviation(episodes, profile_name),
     }
