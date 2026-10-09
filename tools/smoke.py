@@ -4,7 +4,7 @@
 
     python tools/smoke.py
 
-它检查 5 件事，顺序是刻意的：从最底层的纯函数往上走到端到端，
+它检查 6 件事，顺序是刻意的：从最底层的纯函数往上走到端到端，
 任何一层坏了都能立刻定位，而不是看到一个空结果去猜。
 
   1. limiter    —— 双令牌桶的速率、回滚、结算
@@ -12,6 +12,8 @@
   3. cache      —— LRU + TTL 的 18 项边界（含"过期优先于 LRU"）
   4. config     —— run_id 会不会把两次不同配置误判成同一次
   5. 端到端     —— 同一环境下跑两个 variant，打出对照表
+  6. 接线       —— LLMGate 的缓存与计数、TruckAdapter 的协议完整性
+                  （**不需要项目一的代码、不需要 API key**）
 
 不需要任何 API key。退出码 0 = 全绿。
 """
@@ -37,6 +39,7 @@ from evalharness.cache import LRUKVCache, self_test as cache_self_test  # noqa: 
 from evalharness.config import ConfigSnapshot, diff  # noqa: E402
 from evalharness.experiment import compare_table, save_run  # noqa: E402
 from evalharness.limiter import DualTokenBucketLimiter, TokenBucket  # noqa: E402
+from evalharness.llm_gate import LLMGate  # noqa: E402
 from evalharness.observability import ConsoleTracer  # noqa: E402
 from evalharness.runner import run_scenario  # noqa: E402
 from evalharness.scenario import Scenario  # noqa: E402
@@ -69,7 +72,7 @@ class FrozenClock:
 
 # ---------------------------------------------------------------------------
 def s1_limiter() -> None:
-    print("\n[1/5] 限流器：双令牌桶 + 预扣结算")
+    print("\n[1/6] 限流器：双令牌桶 + 预扣结算")
 
     # 速率与突发
     b = TokenBucket(capacity=10, refill_per_sec=10 / 60, clock=FrozenClock())
@@ -101,7 +104,7 @@ def s1_limiter() -> None:
 
 # ---------------------------------------------------------------------------
 def s2_estimator() -> None:
-    print("\n[2/5] Token 预估器：系数来自历史 14 组跑批")
+    print("\n[2/6] Token 预估器：系数来自历史 14 组跑批")
 
     nh = PROFILES["no_history"]
     h5 = PROFILES["history_5"]
@@ -123,7 +126,7 @@ def s2_estimator() -> None:
 
 # ---------------------------------------------------------------------------
 def s3_cache() -> None:
-    print("\n[3/5] 缓存层：LRU + TTL，18 项边界")
+    print("\n[3/6] 缓存层：LRU + TTL，18 项边界")
     check("LRU+TTL 全部边界用例通过", cache_self_test(verbose=False) is True)
 
     c = LRUKVCache(2, 1000)
@@ -135,7 +138,7 @@ def s3_cache() -> None:
 
 # ---------------------------------------------------------------------------
 def s4_config() -> None:
-    print("\n[4/5] Config Snapshot：run_id 由配置内容决定")
+    print("\n[4/6] Config Snapshot：run_id 由配置内容决定")
 
     base = dict(
         model_name="m-a", model_api_url="", temperature=0.0,
@@ -160,7 +163,7 @@ def s4_config() -> None:
 
 # ---------------------------------------------------------------------------
 def s5_end_to_end() -> None:
-    print("\n[5/5] 端到端：同一环境，两个 variant")
+    print("\n[5/6] 端到端：同一环境，两个 variant")
 
     base = Scenario.tiny(max_steps=200, max_tokens_per_driver=5_000_000)
     degenerate = base.with_variant("degenerate", adapter_name="dummy")
@@ -172,7 +175,8 @@ def s5_end_to_end() -> None:
             sc,
             # variant 是**平台传给 adapter 的参数**，不是在 adapter 里写死的。
             # 这一点如果搞错，两个变体会跑出完全相同的结果 —— 而且不会报错，只是静默地白跑。
-            lambda: build(sc.adapter_name, variant=sc.variant),
+            # **kw 用来接 Runner 注入的 gate=：所有 adapter 的工厂签名保持一致。
+            lambda **kw: build(sc.adapter_name, variant=sc.variant, **kw),
             tracer=tracer,
             repo_dir=ROOT,
             impl_paths=[ROOT / "adapters" / "dummy.py"],
@@ -214,13 +218,67 @@ def s5_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
+def s6_wiring() -> None:
+    """接线自检 —— 这一段全绿，说明 D1 的"通路"完成，而且还没花一分钱。
+
+    它刻意**不 import 项目一**：`truck` adapter 在项目一不存在时也必须能被构造
+    （抛可读错误）并通过协议检查。这是"平台与被测对象解耦"的可执行证明，
+    不是文档里的一句承诺。
+    """
+    print("\n[6/6] 接线：LLMGate + TruckAdapter 协议完整性")
+
+    tracer = ConsoleTracer()
+    limiter = DualTokenBucketLimiter(rpm=600, tpm=2_000_000)
+    gate = LLMGate(limiter, tracer, PROFILES["no_history"])
+    payload = {"model": "qwen3-max", "messages": [{"role": "user", "content": "在吗"}]}
+
+    r1 = gate.call(payload, node="agent1", driver_id="d001", step=0)
+    check("LLMGate dry-run 返回 OpenAI 兼容形状", isinstance(r1, dict) and "usage" in r1)
+    check("dry-run 标记可见（防止误以为打了真模型）", r1.get("_dry_run") is True)
+
+    gate.call(payload, node="agent1", driver_id="d001", step=0)
+    check("★ 相同 payload 第二次命中缓存（缓存键含全部输入）", gate.cache_hits == 1,
+          f"cache_hits={gate.cache_hits}")
+
+    gate.call({**payload, "temperature": 0.7}, node="agent2", driver_id="d001", step=0)
+    check("不同 payload 不误命中", gate.cache_hits == 1, f"cache_hits={gate.cache_hits}")
+    check("usage 按次累计（token 账的唯一来源）", gate.usage_total.total > 0)
+
+    cov = tracer.coverage()
+    check("LLMGate 自发开 llm_inference span", cov["llm_inference"] >= 3, f"{cov['llm_inference']}")
+    check("★ 限流/缓存计数器可读出（讲 Q21 时的现场证据）",
+          {"llm.calls", "llm.cache_hit_rate", "llm.tokens_total"} <= set(gate.counters()))
+
+    # --- TruckAdapter：只查「协议完整性 + 报错是否可读」，不碰项目一 ---
+    from adapters.truck import TruckAdapter
+
+    required = ("metadata", "reset", "act", "env_step", "close")
+    missing = [m for m in required if not callable(getattr(TruckAdapter, m, None))]
+    check("TruckAdapter 的 5 个协议方法全部存在", not missing, f"缺: {missing}")
+    check("TruckAdapter 声明 owns_llm_limits=True（一步 3 次调用 -> 按次计账）",
+          getattr(TruckAdapter, "owns_llm_limits", False) is True)
+
+    # 项目一不在本机时必须是**可读的报错**，不是静默降级成 dummy。
+    # 静默降级会让你以为在测项目一，其实在测一个假 Agent —— 而且它不会报错。
+    try:
+        TruckAdapter(gate=gate, project_root=r"Z:\__definitely_not_here__")
+        loud = False
+        note = ""
+    except FileNotFoundError:
+        loud, note = True, ""
+    except Exception as exc:
+        loud, note = True, f"（注意：抛的是 {type(exc).__name__}，期望 FileNotFoundError）"
+    check("项目一不存在时抛可读错误，而不是静默降级", loud, note)
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     print("=" * 72)
     print("AgentEval Harness · smoke 自检")
     print(f"仓库根目录：{ROOT}")
     print("=" * 72)
 
-    for fn in (s1_limiter, s2_estimator, s3_cache, s4_config, s5_end_to_end):
+    for fn in (s1_limiter, s2_estimator, s3_cache, s4_config, s5_end_to_end, s6_wiring):
         try:
             fn()
         except Exception as exc:  # 自检脚本自己绝不能把异常吞掉

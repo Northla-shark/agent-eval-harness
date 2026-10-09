@@ -19,6 +19,7 @@ from .budget.estimator import PROFILES, TokenProfile, estimate_step_tokens
 from .budget.guard import Budget, BudgetGuard
 from .config import ConfigSnapshot
 from .limiter import DualTokenBucketLimiter
+from .llm_gate import LLMGate
 from .observability import ConsoleTracer, Tracer
 from .scenario import Scenario
 from .types import EpisodeResult, StepResult, Usage, ZERO_USAGE
@@ -45,6 +46,7 @@ class RunResult:
             "wall_seconds": round(self.wall_seconds, 3),
             "snapshot": self.snapshot.to_dict(),
             "limiter": self.limiter_counters,
+            "llm": self.extra.get("llm", {}),
             "episodes": [
                 {
                     "driver_id": e.driver_id,
@@ -68,11 +70,12 @@ class Runner:
     def __init__(
         self,
         scenario: Scenario,
-        adapter_factory: Callable[[], AgentAdapter],
+        adapter_factory: Callable[..., AgentAdapter],
         *,
         tracer: Tracer | None = None,
         repo_dir: Path | str = ".",
         impl_paths: list[Path | str] | None = None,
+        llm_transport: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.scenario = scenario
         self.adapter_factory = adapter_factory
@@ -85,6 +88,14 @@ class Runner:
         # 预估器：profile 名字来自场景配置
         self.profile: TokenProfile = PROFILES[scenario.token_profile]
         avg_step = estimate_step_tokens(5, self.profile)
+
+        # LLM 网关：**与 limiter 共享同一个实例**，并且在这里（Runner 里）建而不是在
+        # adapter 里建。理由：限流额度是跨司机共享的，adapter 自己 new 一个就等于
+        # 每个司机各限各的，总数会超。网关随后以依赖注入的形式交给 adapter。
+        #
+        # llm_transport=None -> dry-run。骨架默认不开真模型，这样 smoke 零成本可跑、
+        # 也能在没有 API key 的机器上验证接线。要真跑，见 docs/d1-wiring.md 第 5 节。
+        self.gate = LLMGate(self.limiter, self.tracer, self.profile, transport=llm_transport)
 
         # 三维预算熔断
         self.guard = BudgetGuard(
@@ -123,6 +134,7 @@ class Runner:
             episodes=episodes,
             wall_seconds=time.perf_counter() - t0,
             limiter_counters=self.limiter.counters(),
+            extra={"llm": self.gate.counters()},
         )
 
     async def _guarded(self, driver_id: str, seed: int) -> EpisodeResult:
@@ -133,8 +145,16 @@ class Runner:
 
     # ------------------------------------------------------------------
     async def _run_driver(self, driver_id: str, seed: int) -> EpisodeResult:
-        adapter = self.adapter_factory()
+        # gate 以关键字注入。adapter 不接受的参数（dummy 是显式声明并忽略）不会炸 ——
+        # 所有 adapter 的工厂签名保持一致，是为了让"换一个被测对象"永远是一次配置改动。
+        adapter = self.adapter_factory(gate=self.gate)
         meta = adapter.metadata()
+
+        # 可选能力：adapter 声明"我的每一次模型调用都自己走 LLMGate 计过账了"。
+        # 这时 Runner 就**不再做外层按步预扣** —— 否则同一笔 token 会被记两次，
+        # TPM 桶被扣双份、RPM 桶按 (1 + N节点) 计数，配额会被无声地砍半。
+        # 这不是第 6 个协议方法，只是一个可选属性：只有需要它的 adapter 才提供。
+        self_limited = bool(getattr(adapter, "owns_llm_limits", False))
         steps: list[StepResult] = []
         usage_total: Usage = ZERO_USAGE
         reward_total = 0.0
@@ -155,7 +175,10 @@ class Runner:
 
                 # --- 限流：拿不到就等（自适应退避）---
                 # 这就是对项目一"固定 sleep 2 秒"的替代：等待只发生在真正被限流时。
-                if self.scenario.enforce_limits:
+                # 粒度是 **step**：给那些"一步只打一次模型"的 adapter 用（dummy 就是）。
+                # 一步打多次模型的（truck: 3 个节点）走 self_limited 分支，
+                # 由 LLMGate 按**每次调用**计账 —— 粒度必须跟被测对象的真实调用次数对齐。
+                if self.scenario.enforce_limits and not self_limited:
                     ok, wait = self.limiter.acquire(estimated)
                     if not ok:
                         stall += 1
@@ -173,16 +196,22 @@ class Runner:
                 # --- span 4：LLM 推理 ---
                 # 被测 Agent 是同步的 -> 用 to_thread 隔离，
                 # 绝不允许在协程里直接做阻塞 IO。
+                # scope="step"：这个名字会与 LLMGate 内部 scope="call" 的 span 同时出现。
+                # **不是重名 bug，是层级关系的体现** —— 9 段 Span 是"阶段"划分，
+                # Trace/Span/Generation 是"层级"划分；一次 step 下挂 N 次会议调用。
+                # 指标层按 scope 过滤，人要能同时把两种划分讲出来。
                 with self.tracer.span(
                     "llm_inference", driver_id=driver_id, step=obs.step,
-                    model=meta.model, variant=meta.variant,
+                    model=meta.model, variant=meta.variant, scope="step",
                 ) as box:
                     action, usage = await asyncio.to_thread(adapter.act, obs)
                     box["model_usage_input"] = usage.input_tokens
                     box["model_usage_output"] = usage.output_tokens
 
                 # --- 结算：多退少补 ---
-                self.limiter.settle(estimated, usage.total)
+                # self_limited 时跳过：这笔 token 已在 LLMGate 里逐次结算过。
+                if not self_limited:
+                    self.limiter.settle(estimated, usage.total)
 
                 # --- span 6：工具执行（env 侧推进）---
                 with self.tracer.span(
@@ -244,15 +273,16 @@ class Runner:
 
 def run_scenario(
     scenario: Scenario,
-    adapter_factory: Callable[[], AgentAdapter],
+    adapter_factory: Callable[..., AgentAdapter],
     *,
     tracer: Tracer | None = None,
     repo_dir: Path | str = ".",
     impl_paths: list[Path | str] | None = None,
+    llm_transport: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> RunResult:
     """同步入口。命令行和脚本都用它，免得每处都写 asyncio.run。"""
     runner = Runner(
         scenario, adapter_factory, tracer=tracer, repo_dir=repo_dir,
-        impl_paths=impl_paths,
+        impl_paths=impl_paths, llm_transport=llm_transport,
     )
     return asyncio.run(runner.run())

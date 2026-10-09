@@ -17,8 +17,16 @@ duration_days: 30
 max_steps: 400
 
 # 预算侧（会进 run_id）—— 三维熔断，缺一维就不叫熔断
-max_tokens_per_driver: 400000
-max_wall_time_minutes: 20
+# 下面两个上限取自赛题官方文档，不是自己拍的（出处：docs/01-赛题详情.md「资源与公平性约束」）
+#   原文：「复赛阶段限制为：总仿真运行时长不超过 4 小时，且每个司机 Token 消耗不超过 500 万」
+# 本地开发请用 CLI 覆盖调低，否则一次评测就能烧掉几个月的额度。
+max_tokens_per_driver: 5000000   # 赛题硬上限：每司机 5,000,000 token
+max_wall_time_minutes: 240       # 赛题硬上限：总仿真 ≤ 4 小时
+
+# 数据边界（赛题《数据说明》§1.1 明令，不是建议）：
+#   禁止决策代码直接读取 cargo_dataset.jsonl / drivers.json（含写死路径、open 整表扫描、按行缓存全库）；
+#   观测只能来自环境接口：query_cargo / get_driver_status / query_decision_history。
+# 本仓库不含任何赛题数据；scenarios/ 下的示例数据是合成的。
 
 # 运行侧（不进 run_id）
 concurrency: 4

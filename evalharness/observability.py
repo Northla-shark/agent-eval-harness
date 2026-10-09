@@ -29,6 +29,21 @@ SPAN_NAMES: tuple[str, ...] = (
 )
 
 
+# 扩展轴：上面 9 段是**平台保留的公共词汇表**，指标层按它们聚合。
+# 被测对象内部的阶段（例如项目一的 agent1/agent2/agent3/agent4 四个节点）
+# 属于"它的结构"，**不该被硬编码进平台** —— 否则换一个 Agent 就得改平台。
+# 所以给一条通用的口子：`custom:` 前缀。
+#
+# 一句话讲法：「平台只规定 9 个公共阶段，被测对象可以自报阶段，
+# 但必须带前缀 —— 这样我的聚合口径不会被任何单个 Agent 的结构污染。」
+CUSTOM_PREFIX = "custom:"
+
+
+def is_valid_span_name(name: str) -> bool:
+    """合法的 span 名 = 9 段公共词汇 或 带 `custom:` 前缀的自报阶段。"""
+    return name in SPAN_NAMES or name.startswith(CUSTOM_PREFIX)
+
+
 class Tracer(Protocol):
     """Tracing 后端的最小协议。换 Langfuse / Phoenix / 自建 collector 都实现它。"""
 
@@ -61,7 +76,10 @@ class ConsoleTracer:
 
     @contextmanager
     def span(self, name: str, **attrs: Any) -> Iterator[dict[str, Any]]:
-        assert name in SPAN_NAMES, f"未定义的 span 名: {name!r}（见 SPAN_NAMES）"
+        assert is_valid_span_name(name), (
+            f"未定义的 span 名: {name!r} —— 要么用 SPAN_NAMES 里的公共阶段，"
+            f"要么用 {CUSTOM_PREFIX!r} 前缀自报阶段"
+        )
         box: dict[str, Any] = {}
         t0 = time.perf_counter()
         try:
@@ -88,8 +106,18 @@ class ConsoleTracer:
         """
         out = {name: 0 for name in SPAN_NAMES}
         for r in self.records:
-            out[r.name] = out.get(r.name, 0) + 1
+            # custom: 前缀的不计入 —— 公共口径不能被单个被测对象的结构污染。
+            if r.name in out:
+                out[r.name] += 1
         return out
+
+    def custom_coverage(self) -> dict[str, int]:
+        """被测对象自报的阶段各出现多少次（例如 custom:node_preference）。"""
+        out: dict[str, int] = {}
+        for r in self.records:
+            if r.name.startswith(CUSTOM_PREFIX):
+                out[r.name] = out.get(r.name, 0) + 1
+        return dict(sorted(out.items()))
 
     def render_waterfall(self, driver_id: str, limit: int = 30) -> str:
         """把某个司机的一小段 span 打成瀑布图（文本版）。

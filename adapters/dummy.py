@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import random
+from typing import Any
 
 from evalharness.adapter import register
 from evalharness.budget.estimator import PROFILES
@@ -30,7 +31,15 @@ class DummyAdapter:
               这是"受控对照"的物质基础：环境不变，只变策略。
         days: 仿真天数
         profile_name: 用哪组 token 系数（决定每步开销）
+        gate: LLMGate。**dummy 显式接收并忽略它** ——
+              不是偷懒，是为了让所有 adapter 的工厂签名一致：
+              Runner 统一用 `factory(gate=...)` 构造，换被测对象时不用改 Runner。
     """
+
+    # 可选能力：dummy 一步只"花"一次 token，且不真的调模型，
+    # 所以它让 Runner 在外层按 step 预扣结算（= False）。
+    # truck 是 True —— 它一步打 3 次模型，必须由 LLMGate 按次计账。
+    owns_llm_limits = False
 
     def __init__(
         self,
@@ -38,12 +47,15 @@ class DummyAdapter:
         seed: int = 0,
         days: int = 5,
         profile_name: str = "no_history",
+        gate: Any = None,
     ) -> None:
         self.variant = variant
         self.seed = seed
         self.days = days
         self.profile = PROFILES[profile_name]
         self.profile_name = profile_name
+        # 保留引用只为证明"工厂签名一致"；dummy 不调模型，所以永远不用它。
+        self._gate = gate
         self._rng = random.Random(seed)
         self._sim_minute = 0
         self._idle_streak = 0
